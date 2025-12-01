@@ -4,7 +4,7 @@
 
 Built for educational purposes to explore web scraping this tool scrapes cijapanese.com and archives videos locally for offline viewing. Supports Windows and Linux.
 
-This tool was built with powershell and uses (yt-dlp)[https://github.com/yt-dlp/yt-dlp] as an intermediary to download videos.
+This tool was built with powershell and uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) as an intermediary to download videos.
 
 # How does it work?
 
