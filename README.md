@@ -14,7 +14,10 @@ This script supports using a cookies.txt file with a valid session id token as a
 
 # Usage
 
-Git clone or download the repo
-Start a powershell instance with elevated priveleges
-Navigate to the script directory
-Run the script
+1. Git clone or download the repo
+
+2. Start a powershell instance with elevated priveleges
+
+3. Navigate to the script directory
+
+4. Run the script
