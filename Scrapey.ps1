@@ -1,8 +1,12 @@
 # --- Global Configuration ---
 $JsonFile      = Join-Path $PWD "content.json"
+$OutputFile    = Join-Path $PWD "output.txt"
 $CookiesPath   = Join-Path $PWD "cookies.txt"
 $BaseCdnUrl    = "https://cij-edge.b-cdn.net/prod/hls"
 $RefererUrl    = "https://cijapanese.com/"
+
+# Trap for clean output on exit
+trap { exit 0 }
 
 # OS Detection
 $IsLinuxSystem = $IsLinux -or ($PSVersionTable.Platform -eq "Unix")
@@ -22,9 +26,7 @@ function Get-YtDlpBinary {
 }
 
 function Get-WebHeaders {
-    # Start with Cookies if available
     $Headers = @{ "Referer" = $global:RefererUrl }
-    
     if (Test-Path $CookiesPath) {
         $C = @()
         foreach ($Line in Get-Content $CookiesPath) {
@@ -43,116 +45,120 @@ function Get-SanitizedName {
 }
 
 function Get-LocalContent {
-    if (-not (Test-Path $JsonFile)) {
-        Write-Error "content.json not found! Please place it next to the script."
-        exit
-    }
+    if (-not (Test-Path $JsonFile)) { Write-Error "content.json not found!"; exit }
     try {
         $Raw = Get-Content -Path $JsonFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        # Check for nested 'data.modules' or just 'data' or root array
         if ($Raw.data.modules) { return $Raw.data.modules }
         if ($Raw.data) { return $Raw.data }
         return $Raw 
-    }
-    catch {
-        Write-Error "Error reading content.json. Check format."
-        exit
-    }
+    } catch { Write-Error "Error parsing content.json."; exit }
+}
+
+function Add-ToOutput {
+    param([string]$Id)
+    $Id | Out-File -FilePath $OutputFile -Append -Encoding ASCII
 }
 
 function Invoke-Download {
-    param([string]$Url, [string]$DestFile, [string]$Tool, [string]$Cookies)
+    param([string]$Url, [string]$DestFileTemplate, [string]$Tool, [string]$Cookies)
     
     $ArgsList = @(
-        "-o", "$DestFile", 
+        "-o", "$DestFileTemplate",
         "--concurrent-fragments", "4",
-        "--no-overwrites",
+        "--referer", $global:RefererUrl,
         "--no-warn",
-        "--referer", $global:RefererUrl, # <--- THE FIX for 403 Errors
         $Url
     )
-    
-    # Add cookies to yt-dlp if they exist
-    if (Test-Path $Cookies) {
-        $ArgsList += "--cookies", $Cookies
-    }
+    if (Test-Path $Cookies) { $ArgsList += "--cookies", $Cookies }
 
     & $Tool @ArgsList
+    
+    return ($LASTEXITCODE -eq 0)
 }
 
 # --- Main Execution ---
 
-Write-Host "=== CIJapanese Downloader ===" -ForegroundColor Cyan
+Write-Host "=== CIJapanese Library Manager ===" -ForegroundColor Cyan
 
-# Setup
+# First Run
 $Tool = Get-YtDlpBinary
 $Headers = Get-WebHeaders
-
-# Load JSON
 $VideoList = Get-LocalContent
-Write-Host "Loaded $( $VideoList.Count ) videos from content.json" -ForegroundColor Green
+$CompletedIds = if (Test-Path $OutputFile) { @(Get-Content $OutputFile) } else { @() }
 
-# Directory Setup
-$BaseSaveDir = Read-Host "Enter Save Directory (Press Enter for current folder)"
-if ([string]::IsNullOrWhiteSpace($BaseSaveDir)) { 
-    $BaseSaveDir = Join-Path $PWD "Downloads" 
-    Write-Host "Using default: $BaseSaveDir" -ForegroundColor Gray
-}
+Write-Host "Loaded $( $VideoList.Count ) videos." -ForegroundColor Green
+Write-Host "Completed: $( $CompletedIds.Count )" -ForegroundColor Green
+
+# Paths
+$BaseSaveDir = Read-Host "Enter Save Directory (Press Enter for 'Downloads')"
+if ([string]::IsNullOrWhiteSpace($BaseSaveDir)) { $BaseSaveDir = Join-Path $PWD "Downloads" }
 if (-not (Test-Path $BaseSaveDir)) { New-Item -ItemType Directory -Path $BaseSaveDir | Out-Null }
 
-Write-Host "`n=== Starting Batch ===" -ForegroundColor Yellow
+Write-Host "`n=== Starting Queue ===" -ForegroundColor Yellow
+Write-Host "Working in: $BaseSaveDir" -ForegroundColor Gray
 
-# Processing Loop
 foreach ($Item in $VideoList) {
-    
-    # --- Metadata Extraction ---
-    $Id = $Item.id
+    # --- Metadata ---
+    $Id = "$($Item.id)"
     if (-not $Id) { continue }
+    if ($CompletedIds -contains $Id) { continue }
 
-    # Get Title (English preferred)
-    $TitleRaw = "Video_$Id"
-    if ($Item.plan.titleEN) { $TitleRaw = $Item.plan.titleEN }
-    elseif ($Item.titleEN)  { $TitleRaw = $Item.titleEN }
+    $TitleRaw = if ($Item.plan.titleEN) { $Item.plan.titleEN } elseif ($Item.titleEN) { $Item.titleEN } else { "Video_$Id" }
+    $Level    = if ($Item.level) { $Item.level } else { "Uncategorized" }
+    $BunnyId  = if ($Item.plan.bunnyId) { $Item.plan.bunnyId } elseif ($Item.bunnyId) { $Item.bunnyId } else { $null }
+    
+    if (-not $BunnyId) { continue } 
 
-    # Get Bunny ID
-    $BunnyId = $null
-    if ($Item.plan.bunnyId) { $BunnyId = $Item.plan.bunnyId }
-    elseif ($Item.bunnyId)  { $BunnyId = $Item.bunnyId }
+    $SafeTitle = Get-SanitizedName -Name $TitleRaw
+    $SafeLevel = Get-SanitizedName -Name $Level
 
-    if (-not $BunnyId) {
-        Write-Warning "Skipping '$TitleRaw' (No BunnyID found)."
+    # --- Path Logic ---
+    $LevelDir    = Join-Path $BaseSaveDir $SafeLevel
+    $NewVideoDir = Join-Path $LevelDir $SafeTitle
+    $OldVideoDir = Join-Path $BaseSaveDir $SafeTitle
+
+    # Migrate Old -> New
+    if ((Test-Path $OldVideoDir) -and -not (Test-Path $NewVideoDir)) {
+        Write-Host "Migrating '$SafeTitle' to '$SafeLevel'..." -ForegroundColor Magenta
+        if (-not (Test-Path $LevelDir)) { New-Item -ItemType Directory -Path $LevelDir | Out-Null }
+        Move-Item -Path $OldVideoDir -Destination $LevelDir
+    }
+
+    # Verify File Existence
+    if (-not (Test-Path $NewVideoDir)) { New-Item -ItemType Directory -Path $NewVideoDir | Out-Null }
+
+    $AlreadyExists = $false
+    foreach ($Ext in @(".mp4", ".mkv", ".webm")) {
+        if (Test-Path (Join-Path $NewVideoDir "$SafeTitle$Ext")) {
+            $AlreadyExists = $true; break
+        }
+    }
+
+    if ($AlreadyExists) {
+        Write-Host "Found Existing: [$SafeLevel] $SafeTitle" -ForegroundColor Green
+        Add-ToOutput -Id $Id
         continue
     }
 
-    $SafeTitle = Get-SanitizedName -Name $TitleRaw
-    Write-Host "Processing: $TitleRaw" -ForegroundColor Cyan
+    # Download
+    Write-Host "Downloading: [$SafeLevel] $SafeTitle" -ForegroundColor Cyan
     
-    # --- Folder Setup ---
-    $VideoDir = Join-Path $BaseSaveDir $SafeTitle
-    if (-not (Test-Path $VideoDir)) { New-Item -ItemType Directory -Path $VideoDir | Out-Null }
-
-    # --- URL Construction ---
     $StreamUrl = "$BaseCdnUrl/$BunnyId/playlist.m3u8"
     $SubUrl    = "$BaseCdnUrl/$BunnyId/subtitles.vtt"
+    $Template  = Join-Path $NewVideoDir "$SafeTitle.%(ext)s"
 
-    # --- Execution ---
-    
-    # Download Video
-    $VidPath = Join-Path $VideoDir "$SafeTitle.%(ext)s"
-    
-    # Pass the cookies file path to yt-dlp if it exists
-    Invoke-Download -Url $StreamUrl -DestFile $VidPath -Tool $Tool -Cookies $CookiesPath
+    $Success = Invoke-Download -Url $StreamUrl -DestFileTemplate $Template -Tool $Tool -Cookies $CookiesPath
 
-    # Download Subtitles
-    $SubPath = Join-Path $VideoDir "$SafeTitle.vtt"
-    if (-not (Test-Path $SubPath)) {
-        Write-Host "    Fetching Subtitles..." -ForegroundColor Gray
-        try {
-            # Added Referer Header here too
-            Invoke-WebRequest -Uri $SubUrl -OutFile $SubPath -Headers $Headers -UserAgent "Mozilla/5.0" -ErrorAction Stop
-        } catch {
-            # Suppress error if subtitles don't exist (common for some videos)
-            Write-Host "    (No subtitles found)" -ForegroundColor DarkGray
+    if ($Success) {
+        Add-ToOutput -Id $Id
+        
+        # Subtitles
+        $SubPath = Join-Path $NewVideoDir "$SafeTitle.vtt"
+        if (-not (Test-Path $SubPath)) {
+            try {
+                Invoke-WebRequest -Uri $SubUrl -OutFile $SubPath -Headers $Headers -UserAgent "Mozilla/5.0" -ErrorAction Stop
+                Write-Host "    + Subtitles" -ForegroundColor Green
+            } catch {}
         }
     }
 }
