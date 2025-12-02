@@ -1,3 +1,13 @@
+<#
+.SYNOPSIS
+    CIJapanese Library Manager (Robust Filename Fix)
+.DESCRIPTION
+    1. OUTPUT: Uses yt-dlp's native progress bar.
+    2. RESUME: Checks output.txt and disk state.
+    3. MIGRATE: Auto-moves old folders.
+    4. ROBUST: Handles illegal characters in titles without crashing.
+#>
+
 # --- Global Configuration ---
 $JsonFile      = Join-Path $PWD "content.json"
 $OutputFile    = Join-Path $PWD "output.txt"
@@ -5,8 +15,12 @@ $CookiesPath   = Join-Path $PWD "cookies.txt"
 $BaseCdnUrl    = "https://cij-edge.b-cdn.net/prod/hls"
 $RefererUrl    = "https://cijapanese.com/"
 
-# Trap for clean output on exit
-trap { exit 0 }
+# Silent Exit on Ctrl+C
+[console]::TreatControlCAsInput = $false 
+trap { 
+    Write-Host "`n[!] Interrupted." -ForegroundColor Yellow
+    exit 0
+}
 
 # OS Detection
 $IsLinuxSystem = $IsLinux -or ($PSVersionTable.Platform -eq "Unix")
@@ -41,7 +55,10 @@ function Get-WebHeaders {
 
 function Get-SanitizedName {
     param([string]$Name)
-    return $Name -replace '[\\/*?:"<>|]', "" -replace '\s+', " "
+    $Clean = $Name -replace '[\\/*?:"<>|]', ""
+    $Clean = $Clean -replace '\s+', " "
+    $Clean = $Clean.Trim().TrimEnd('.')
+    return $Clean
 }
 
 function Get-LocalContent {
@@ -60,13 +77,14 @@ function Add-ToOutput {
 }
 
 function Invoke-Download {
-    param([string]$Url, [string]$DestFileTemplate, [string]$Tool, [string]$Cookies)
+    param([string]$Url, [string]$DestFile, [string]$Tool, [string]$Cookies)
     
     $ArgsList = @(
-        "-o", "$DestFileTemplate",
+        "-o", "$DestFile", 
         "--concurrent-fragments", "4",
-        "--referer", $global:RefererUrl,
+        "--no-overwrites",
         "--no-warn",
+        "--referer", $global:RefererUrl,
         $Url
     )
     if (Test-Path $Cookies) { $ArgsList += "--cookies", $Cookies }
@@ -80,7 +98,7 @@ function Invoke-Download {
 
 Write-Host "=== CIJapanese Library Manager ===" -ForegroundColor Cyan
 
-# First Run
+# Init
 $Tool = Get-YtDlpBinary
 $Headers = Get-WebHeaders
 $VideoList = Get-LocalContent
@@ -101,6 +119,8 @@ foreach ($Item in $VideoList) {
     # --- Metadata ---
     $Id = "$($Item.id)"
     if (-not $Id) { continue }
+    
+    # Fast skip if known complete
     if ($CompletedIds -contains $Id) { continue }
 
     $TitleRaw = if ($Item.plan.titleEN) { $Item.plan.titleEN } elseif ($Item.titleEN) { $Item.titleEN } else { "Video_$Id" }
@@ -112,54 +132,60 @@ foreach ($Item in $VideoList) {
     $SafeTitle = Get-SanitizedName -Name $TitleRaw
     $SafeLevel = Get-SanitizedName -Name $Level
 
-    # --- Path Logic ---
-    $LevelDir    = Join-Path $BaseSaveDir $SafeLevel
-    $NewVideoDir = Join-Path $LevelDir $SafeTitle
-    $OldVideoDir = Join-Path $BaseSaveDir $SafeTitle
+    try {
+        # --- Path Resolution & Migration ---
+        $LevelDir    = Join-Path $BaseSaveDir $SafeLevel
+        $NewVideoDir = Join-Path $LevelDir $SafeTitle 
+        $OldVideoDir = Join-Path $BaseSaveDir $SafeTitle 
 
-    # Migrate Old -> New
-    if ((Test-Path $OldVideoDir) -and -not (Test-Path $NewVideoDir)) {
-        Write-Host "Migrating '$SafeTitle' to '$SafeLevel'..." -ForegroundColor Magenta
-        if (-not (Test-Path $LevelDir)) { New-Item -ItemType Directory -Path $LevelDir | Out-Null }
-        Move-Item -Path $OldVideoDir -Destination $LevelDir
-    }
-
-    # Verify File Existence
-    if (-not (Test-Path $NewVideoDir)) { New-Item -ItemType Directory -Path $NewVideoDir | Out-Null }
-
-    $AlreadyExists = $false
-    foreach ($Ext in @(".mp4", ".mkv", ".webm")) {
-        if (Test-Path (Join-Path $NewVideoDir "$SafeTitle$Ext")) {
-            $AlreadyExists = $true; break
+        # Migrate Old -> New
+        if ((Test-Path $OldVideoDir) -and -not (Test-Path $NewVideoDir)) {
+            Write-Host "Migrating '$SafeTitle'..." -ForegroundColor Magenta
+            if (-not (Test-Path $LevelDir)) { New-Item -ItemType Directory -Path $LevelDir | Out-Null }
+            Move-Item -Path $OldVideoDir -Destination $LevelDir -ErrorAction Stop
         }
-    }
 
-    if ($AlreadyExists) {
-        Write-Host "Found Existing: [$SafeLevel] $SafeTitle" -ForegroundColor Green
-        Add-ToOutput -Id $Id
-        continue
-    }
+        # Verify File Existence
+        if (-not (Test-Path $NewVideoDir)) { New-Item -ItemType Directory -Path $NewVideoDir | Out-Null }
 
-    # Download
-    Write-Host "Downloading: [$SafeLevel] $SafeTitle" -ForegroundColor Cyan
-    
-    $StreamUrl = "$BaseCdnUrl/$BunnyId/playlist.m3u8"
-    $SubUrl    = "$BaseCdnUrl/$BunnyId/subtitles.vtt"
-    $Template  = Join-Path $NewVideoDir "$SafeTitle.%(ext)s"
+        $AlreadyExists = $false
+        foreach ($Ext in @(".mp4", ".mkv", ".webm")) {
+            if (Test-Path (Join-Path $NewVideoDir "$SafeTitle$Ext")) {
+                $AlreadyExists = $true; break
+            }
+        }
 
-    $Success = Invoke-Download -Url $StreamUrl -DestFileTemplate $Template -Tool $Tool -Cookies $CookiesPath
+        if ($AlreadyExists) {
+            # Silent update of output.txt if found on disk
+            Add-ToOutput -Id $Id
+            continue
+        }
 
-    if ($Success) {
-        Add-ToOutput -Id $Id
+        # Download
+        Write-Host "Processing: $SafeTitle" -ForegroundColor Cyan
         
-        # Subtitles
-        $SubPath = Join-Path $NewVideoDir "$SafeTitle.vtt"
-        if (-not (Test-Path $SubPath)) {
-            try {
-                Invoke-WebRequest -Uri $SubUrl -OutFile $SubPath -Headers $Headers -UserAgent "Mozilla/5.0" -ErrorAction Stop
-                Write-Host "    + Subtitles" -ForegroundColor Green
-            } catch {}
+        $StreamUrl = "$BaseCdnUrl/$BunnyId/playlist.m3u8"
+        $SubUrl    = "$BaseCdnUrl/$BunnyId/subtitles.vtt"
+        $Template  = Join-Path $NewVideoDir "$SafeTitle.%(ext)s"
+
+        $Success = Invoke-Download -Url $StreamUrl -DestFile $Template -Tool $Tool -Cookies $CookiesPath
+
+        if ($Success) {
+            Add-ToOutput -Id $Id
+            
+            # Subtitles
+            $SubPath = Join-Path $NewVideoDir "$SafeTitle.vtt"
+            if (-not (Test-Path $SubPath)) {
+                try {
+                    Invoke-WebRequest -Uri $SubUrl -OutFile $SubPath -Headers $Headers -UserAgent "Mozilla/5.0" -ErrorAction Stop
+                    Write-Host "    + Subtitles" -ForegroundColor Green
+                } catch {}
+            }
         }
+    }
+    catch {
+        Write-Warning "Skipping '$SafeTitle' due to file system error: $($_.Exception.Message)"
+        continue
     }
 }
 
